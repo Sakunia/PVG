@@ -139,7 +139,7 @@ private:
 
 #if WITH_EDITORONLY_DATA
 	// Transient data, either de-compressed on load or dynamically.
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY()
 	TArray<FRawRegionVisibilityData16> GridData;
 #endif
 	

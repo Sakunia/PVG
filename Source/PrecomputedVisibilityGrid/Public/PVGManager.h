@@ -50,6 +50,9 @@ public:
 
 	static APVGManager* GetManager() { return Manager; }
 	
+	UFUNCTION(BlueprintCallable)
+	static void ReportActorToPVGManager(AActor* Actor);
+
 protected:
 	// Called when the game starts or when spawned
 	virtual void BeginPlay() override;
@@ -110,6 +113,24 @@ public:
 
 	/*Saved on asset data.*/
 	FBox GridBounds;
+	
+	UFUNCTION(CallInEditor)
+	void Test();
+
+	UPROPERTY(EditAnywhere,Category="Debug",meta = (AllowPrivateAccess = true))
+	FVector LocationA;
+
+	UPROPERTY(EditAnywhere,Category="Debug",meta = (AllowPrivateAccess = true))
+	FVector LocationB;
+	
+	UPROPERTY(EditAnywhere,Category="Debug",meta = (AllowPrivateAccess = true))
+	FVector Vieuw;
+
 #endif
 #endif
+	UFUNCTION(BlueprintCallable)
+	static TArray<FVector> boxverts(FBox box);
+	
+	UFUNCTION(BlueprintCallable)
+	static TArray<FVector2D> Testlala(FBox A, FBox B, FVector ViewLocation, FRotator ViewRotation, UObject* worldcontext );
 };

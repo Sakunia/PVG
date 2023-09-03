@@ -2,33 +2,13 @@
 
 
 #include "PVGPrecomputedGridDataAsset.h"
-
+#include "PrecomputedVisibilityGrid.h"
 #include "UObject/ObjectSaveContext.h"
-
-int32 XYZToIndex(int32 x, int32 y, int32 z, const UPVGPrecomputedGridDataAsset* Self)
-{
-	return (z * Self->GetGridSizeX() * Self->GetGridSizeY()) + (y * Self->GetGridSizeX()) + x;
-}
-
-int32 XYZToIndex(FIntVector XYZ, const UPVGPrecomputedGridDataAsset* Self)
-{
-	return (XYZ.Z * Self->GetGridSizeX() * Self->GetGridSizeY()) + (XYZ.Y * Self->GetGridSizeX()) + XYZ.X;
-}
-
-FIntVector IndexTo3D(int32 Index, const UPVGPrecomputedGridDataAsset* Self)
-{
-	uint16 z = Index / (Self->GetGridSizeX() * Self->GetGridSizeY());
-	Index -= (z * Self->GetGridSizeX() * Self->GetGridSizeY());
-	uint16 y = Index / Self->GetGridSizeX();
-	uint16 x = Index % Self->GetGridSizeX();
-
-	return FIntVector(x,y,z);
-};
 
 TArray<uint16> FPackedVisibilityData::Unpack(const FPackedVisibilityData& Entry, const UPVGPrecomputedGridDataAsset* Self)
 {
 	TArray<uint16> OutArray;
-	const FIntVector OriginXYZ = IndexTo3D(Entry.Location, Self);
+	const FIntVector OriginXYZ = IndexTo3D(Entry.Location, Self->GetGridSizeX(),Self->GetGridSizeY());
 	
 	for (int32 x = 0; x <= Entry.SizeX; x++)
 	{
@@ -37,7 +17,7 @@ TArray<uint16> FPackedVisibilityData::Unpack(const FPackedVisibilityData& Entry,
 			for (int32 z = 0; z <= Entry.SizeZ; z++)
 			{
 				const FIntVector Location = OriginXYZ + FIntVector(x,y,z);
-				OutArray.Add(XYZToIndex(Location,Self));
+				OutArray.Add(XYZToIndex(Location,Self->GetGridSizeX(),Self->GetGridSizeY()));
 			}
 		}
 	}
@@ -57,78 +37,32 @@ TArray<uint16> UPVGPrecomputedGridDataAsset::GetCellData(int32 CellId) const
 	
 	return Data;
 }
-#if 0
-void UPVGPrecomputedGridDataAsset::CompressData(const FRawRegionVisibilityData16& Source, FRawRegionVisibilityCompressed& Target)
-{
-	Target.NumEntries = Source.InvisibleRegions.Num();
-
-	if (Target.NumEntries == 0)
-	{
-		// Nothing to compress.
-		return;
-	}
-	
-	// Calculate the compressed size bound
-	int32 CompressedSizeBound = FCompression::CompressMemoryBound(NAME_Zlib, Source.InvisibleRegions.Num() * Source.InvisibleRegions.GetTypeSize());
-	const int32 UnCompressedSize = Source.InvisibleRegions.Num() * Source.InvisibleRegions.GetTypeSize();
-	
-	// Allocate memory for the compressed data
-	Target.CompressedData.SetNumUninitialized(CompressedSizeBound);
-
-	// Compress the data
-	if (!FCompression::CompressMemory(NAME_Zlib, Target.CompressedData.GetData(), CompressedSizeBound, Source.InvisibleRegions.GetData(), UnCompressedSize,COMPRESS_BiasSize))
-	{
-		UE_LOG(LogTemp,Warning,TEXT("Failed to compress"));
-	}
-
-	// Resize.
-	Target.CompressedData.SetNum(CompressedSizeBound);
-}
-#endif
-#if 0
-TArray<uint16> UPVGPrecomputedGridDataAsset::UnCompressData(const FRawRegionVisibilityCompressed& Target)
-{
-	if (Target.NumEntries == 0)
-	{
-		// Nothing to uncompress.
-		return TArray<uint16>();	
-	}
-	
-	TArray<uint16> DecompressedData;
-
-	// Allocate memory for the decompressed data
-	DecompressedData.SetNumUninitialized(Target.NumEntries);
-
-	// Decompress the data
-	if (!FCompression::UncompressMemory(NAME_Zlib, DecompressedData.GetData(), DecompressedData.Num() * sizeof(uint16), Target.CompressedData.GetData(), Target.CompressedData.Num(),COMPRESS_BiasSize))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("Failed to decompress!"));
-	}
-	
-	return DecompressedData;
-}
-#endif
 #if WITH_EDITORONLY_DATA
 
 void UPVGPrecomputedGridDataAsset::PreSave(FObjectPreSaveContext SaveContext)
 {
 	Super::PreSave(SaveContext);
-	// Cube compression.
-	GridCellData.SetNumZeroed(GridData.Num());
 
-	constexpr int32 NumTasks = 32;
-	const int32 NumPerTask = FMath::DivideAndRoundUp(GridData.Num(), NumTasks);
-	
-	ParallelFor(NumTasks,[&](int32 TaskID)
+	if (GridData.Num() > 0)
 	{
-		const int32 Start = TaskID * NumPerTask;
-		const int32 End = FMath::Min(Start + NumPerTask,GridData.Num());
+		UE_LOG(LogTemp,Warning,TEXT("Compressing"));
+		// Cube compression.
+		GridCellData.SetNumZeroed(GridData.Num());
 
-		for (int32 i = Start; i < End; i++)
+		constexpr int32 NumTasks = 32;
+		const int32 NumPerTask = FMath::DivideAndRoundUp(GridData.Num(), NumTasks);
+	
+		ParallelFor(NumTasks,[&](int32 TaskID)
 		{
-			CubeCompress(GridData[i],GridCellData[i].CellData);
-		}
-	});	
+			const int32 Start = TaskID * NumPerTask;
+			const int32 End = FMath::Min(Start + NumPerTask,GridData.Num());
+
+			for (int32 i = Start; i < End; i++)
+			{
+				CubeCompress(GridData[i],GridCellData[i].CellData);
+			}
+		});
+	}
 }
 #endif	
 
@@ -164,7 +98,6 @@ void UPVGPrecomputedGridDataAsset::CubeCompress(const FRawRegionVisibilityData16
 		Entries.Add(Origin);
 
 		/* TODO, we can isolate the known new entries instead of just testing all of them. */
-		
 		while (bCanGrowX || bCanGrowY || bCanGrowZ)
 		{
 			if (bCanGrowX)
@@ -173,8 +106,8 @@ void UPVGPrecomputedGridDataAsset::CubeCompress(const FRawRegionVisibilityData16
 				
 				for (const uint16& Entry : Entries)
 				{
-					FIntVector Loc = IndexTo3D(Entry,this);
-					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(1,0,0), this);
+					FIntVector Loc = IndexTo3D(Entry,GetGridSizeX(),GetGridSizeY());
+					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(1,0,0), GetGridSizeX(),GetGridSizeY());
 
 					if (Entries.Contains(TestLocation))
 					{
@@ -206,8 +139,8 @@ void UPVGPrecomputedGridDataAsset::CubeCompress(const FRawRegionVisibilityData16
 
 				for (const uint16& Entry : Entries)
 				{
-					FIntVector Loc = IndexTo3D(Entry,this);
-					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(0,1,0), this);
+					FIntVector Loc = IndexTo3D(Entry,GetGridSizeX(),GetGridSizeY());
+					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(0,1,0), GetGridSizeX(),GetGridSizeY());
 
 					if (Entries.Contains(TestLocation))
 					{
@@ -239,8 +172,8 @@ void UPVGPrecomputedGridDataAsset::CubeCompress(const FRawRegionVisibilityData16
 
 				for (const uint16& Entry : Entries)
 				{
-					FIntVector Loc = IndexTo3D(Entry,this);
-					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(0,0,1), this);
+					FIntVector Loc = IndexTo3D(Entry,GetGridSizeX(),GetGridSizeY());
+					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(0,0,1), GetGridSizeX(),GetGridSizeY());
 
 					if (Entries.Contains(TestLocation))
 					{

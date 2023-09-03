@@ -25,7 +25,14 @@ protected:
 	virtual void BeginPlay() override;
 
 	virtual UPVGPrecomputedGridDataAsset* GetOrCreateCellData(FIntVector GridSize);
+	
+	bool BoxOcclusion(uint16 Location, uint16 Target, FBox BaseBox);
 
+	bool BoxCornerTraceCheck(FVector A, FVector B, FBox Base);
+
+	/* rebuild simplified occlusion scene.*/
+	void UpdateBoxScene();
+	
 public:
 	// @Returns "true" when we are already at the location
 	bool MoveToLocation(int32 Index);
@@ -49,4 +56,9 @@ private:
 	/* Are the scene captures rotation setup?
 	 * if not, we rotate them and test their result next frame. */
 	bool bAreLocationUpToDate = false;
+
+	TArray<uint16> ViewBlockers;
+	TArray<FBox> BoxScene;
+
+	double BeginTime;
 };

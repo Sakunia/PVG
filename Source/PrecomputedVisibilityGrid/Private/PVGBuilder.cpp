@@ -3,17 +3,27 @@
 
 #include "PVGBuilder.h"
 
+#include "PrecomputedVisibilityGrid.h"
 #include "PVGManager.h"
 #include "PVGPrecomputedGridDataAsset.h"
 #include "AssetRegistry/AssetRegistryModule.h"
-#include "Components/SceneCaptureComponent2D.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
-#include "Kismet/KismetRenderingLibrary.h"
 #include "UObject/SavePackage.h"
 
+#define BOX_SCENE 1
 
 TAutoConsoleVariable<float> CVARPVGBuilderOcclusionTestMultiplier(TEXT("r.Culling.Builder.OcclusioCullSizeTestMultiplier"),1.01,TEXT("Scale adjustment for occlusion test."));
+
+FIntVector IndexTo3D_(int32 Index, const UPVGPrecomputedGridDataAsset* Self)
+{
+	uint16 z = Index / (Self->GetGridSizeX() * Self->GetGridSizeY());
+	Index -= (z * Self->GetGridSizeX() * Self->GetGridSizeY());
+	uint16 y = Index / Self->GetGridSizeX();
+	uint16 x = Index % Self->GetGridSizeX();
+
+	return FIntVector(x,y,z);
+};
 
 // Sets default values
 APVGBuilder::APVGBuilder()
@@ -41,6 +51,7 @@ void APVGBuilder::Initialize(const TArray<FVector>& InLocations, FIntVector Grid
 	UPVGPrecomputedGridDataAsset* Asset = GetOrCreateCellData(GridSize);
 	
 	bIsInitialized = true;
+	BeginTime = FPlatformTime::Seconds();
 }
 
 // Called when the game starts or when spawned
@@ -69,11 +80,21 @@ UPVGPrecomputedGridDataAsset* APVGBuilder::GetOrCreateCellData(FIntVector GridSi
 
 		if (Obj)
 		{
+			FSavePackageArgs SaveArgs;
+			SaveArgs.TopLevelFlags = RF_Standalone;
+			SaveArgs.SaveFlags = SAVE_NoError;
+
 			const FString PackageName = CellDataAsset->GetName();
 			const FString PackageFileName = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
-
+			
+			const bool bSucceeded = UPackage::SavePackage(CellDataAsset, NULL,*PackageName,SaveArgs);
 			// Save Package.
-			UPackage::SavePackage(CellDataAsset, NULL, RF_Public | RF_Standalone, *PackageName,GError,nullptr,false,true,SAVE_NoError);
+			//const bool bSucceeded = UPackage::SavePackage(CellDataAsset, NULL, RF_Public | RF_Standalone, *PackageName,GError,nullptr,false,true,SAVE_NoError);
+			if (!bSucceeded)
+			{
+				UE_LOG(LogTemp, Error, TEXT("Package '%s' wasn't saved!"), *PackageName)
+			}
+
 			Obj->MarkPackageDirty();
 			CellDataAsset->SetDirtyFlag(true);
 		}
@@ -98,6 +119,321 @@ UPVGPrecomputedGridDataAsset* APVGBuilder::GetOrCreateCellData(FIntVector GridSi
 	return Manager->GridDataAsset;
 }
 
+bool APVGBuilder::BoxOcclusion(uint16 Location, uint16 Target, FBox BaseBox)
+{
+	TArray<FBox> Blockers;
+	
+	const FVector CameraLocation =		LocationsToBuild[Location];
+	const FRotator CameraViewRotator =	UKismetMathLibrary::FindLookAtRotation(LocationsToBuild[Location],LocationsToBuild[Target]);
+	const FVector TargetLocation =		LocationsToBuild[Target];
+	
+	for (int32 i = 0; i < BoxScene.Num(); i++)
+	{
+		FVector Hit, Normal;
+		float Time;
+		if (FMath::LineExtentBoxIntersection(BoxScene[i],CameraLocation,TargetLocation,BaseBox.GetExtent(),Hit,Normal,Time))
+		{
+			Blockers.Add(BoxScene[i]);
+		}
+	}
+
+	if (Blockers.Num() == 0)
+	{
+		return false;
+	}
+	
+	constexpr float HalfFOVRadians = FMath::DegreesToRadians<float>(50) * 0.5f;
+	FMatrix const ViewRotationMatrix = FInverseRotationMatrix(CameraViewRotator) * FMatrix( FPlane(0,	0,	1,	0), FPlane(1,	0,	0,	0), FPlane(0,	1,	0,	0), FPlane(0,	0,	0,	1));
+	FMatrix const ProjectionMatrix = FReversedZPerspectiveMatrix( HalfFOVRadians, HalfFOVRadians, 1, 1, GNearClippingPlane, GNearClippingPlane );
+	FMatrix const ViewProjectionMatrix = FTranslationMatrix(-CameraLocation) * ViewRotationMatrix * ProjectionMatrix;
+	
+	// Project out target points
+	FVector TargetVerts3D[8];
+	TArray<FVector2d> TargetVertsInScreenSpace;
+		
+	const FBox TargetBox = BaseBox.MoveTo(LocationsToBuild[Target]);
+	TargetBox.GetVertices(TargetVerts3D);
+
+	for (int32 i = 0; i < 8; i++)
+	{
+		FVector2D ScreenPosition;
+		// TODO check if we need to respect the outcome of this function	
+		FSceneView::ProjectWorldToScreen(TargetVerts3D[i], FIntRect(0,0,1000,1000), ViewProjectionMatrix, ScreenPosition);
+		TargetVertsInScreenSpace.Add(ScreenPosition);
+	}
+	constexpr uint8 QuadFaces[6][4] {{0,1,6,2},{0,1,5,3},{2,6,7,4},{0,2,4,3},{1,6,7,5},{3,5,7,4}};
+	
+	constexpr int32 NumTasks =	24;
+	int32 NumPerTask = FMath::DivideAndRoundUp(Blockers.Num(), NumTasks);
+	TArray<bool> Results;
+	Results.SetNumZeroed(NumTasks);
+
+	ParallelFor(NumTasks,[&](int32 Task)
+	{
+		const int32 Begin = NumPerTask * Task;
+		const int32 End = FMath::Min(Begin + NumPerTask,Blockers.Num());
+		
+		for (int32 i = Begin; i < End; i++)
+		{
+			// check if we can grow the box.
+			FVector BlockerVerts3D[8];
+			TArray<FVector2d> BlockerVertsInScreenSpace;
+			const FBox& BlockerBox = BoxScene[i];
+			BlockerBox.GetVertices(BlockerVerts3D);
+			
+			for (int32 j = 0; j < 8; j++)
+			{
+				FVector2D ScreenPosition;
+				// TODO check if we need to respect the outcome of this function	
+				FSceneView::ProjectWorldToScreen(BlockerVerts3D[j], FIntRect(0,0,1000,1000), ViewProjectionMatrix, ScreenPosition);
+
+				BlockerVertsInScreenSpace.Add(ScreenPosition);
+			}
+						
+			// compare points
+			int32 PointsInside = 0;
+
+			for (int32 Point = 0; Point < 8; Point++)
+			{
+				// For each shape
+				for (int32 Face = 0; Face < 6; Face++)
+				{
+					int32 Intersections = 0;
+					for (int32 Edge = 0; Edge < 4; Edge++)
+					{
+						FVector IntersectionPoint;
+						if (FMath::SegmentIntersection2D(
+							FVector(BlockerVertsInScreenSpace[QuadFaces[Face][Edge]],0),
+							FVector(BlockerVertsInScreenSpace[QuadFaces[Face][(Edge + 1) % 4]],0),
+							FVector(TargetVertsInScreenSpace[Point],0),
+							FVector(TargetVertsInScreenSpace[Point] + FVector2d(200000,0),0),IntersectionPoint))
+						{
+							Intersections++;
+						}
+					}
+			
+					const bool IsEven = Intersections % 2 == 0;
+			
+					if (!IsEven)
+					{
+						PointsInside++;
+						break;
+					}
+				}
+			}
+
+			if (PointsInside == 8)
+			{
+				Results[Task] = true;
+				break;
+			}
+		}
+	});
+
+	for (bool Result : Results)
+	{
+		if (Result)
+			return true;
+	}
+	
+	return false;
+}
+
+bool APVGBuilder::BoxCornerTraceCheck(FVector A, FVector B, FBox Base)
+{
+	FCollisionResponseParams ResponseParams;
+	ResponseParams.CollisionResponse.SetAllChannels(ECollisionResponse::ECR_Block);
+	
+	FCollisionQueryParams QueryParams;
+	QueryParams.bTraceComplex = true;
+	QueryParams.AddIgnoredActor(APVGManager::GetManager()->Player);
+	
+	FBox ABox = Base.MoveTo(A);
+	FBox BBox = Base.MoveTo(B);
+
+	FVector AVertices[8];
+	FVector BVertices[8];
+	ABox.GetVertices(AVertices);
+	BBox.GetVertices(BVertices);
+
+	for (int32 i = 0; i < 8; i++)
+	{
+		const FVector& AVert = AVertices[i];
+					
+		for (int32 j = 0; j < 8; j++)
+		{
+			const FVector& BVert = BVertices[j];
+						
+			if(!GetWorld()->LineTraceTestByChannel(AVert,BVert,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void APVGBuilder::UpdateBoxScene()
+{
+	
+	const UPVGPrecomputedGridDataAsset* Asset = APVGManager::GetManager()->GridDataAsset;
+	const uint16 MaxX  = Asset->GetGridSizeX();
+	const uint16 MaxY = Asset->GetGridSizeY();
+	const FBox SourceBox = Asset->GetCellBox();
+	TSet<uint16> Processed;
+
+	BoxScene.Reset();
+	
+	int32 CurrentBox = 0;
+	TArray<FBox> Boxes;
+
+	constexpr bool MinimalMemoryOptimization = true;
+
+	// Build biggest boxes.
+	while ( CurrentBox <  ViewBlockers.Num())
+	{
+		bool bCanGrowX = true;
+		bool bCanGrowY = true;
+		bool bCanGrowZ = true;
+		
+		uint16 X = 0;
+		uint16 Y = 0;
+		uint16 Z = 0;
+
+		const uint16 Origin = ViewBlockers[CurrentBox];
+
+		// Add origin.
+		TSet<uint16> Entries;
+		Entries.Add(Origin);
+		
+		while (bCanGrowX || bCanGrowY || bCanGrowZ)
+		{
+			if (bCanGrowX)
+			{
+				TSet<uint16> TempEntriesX;
+				
+				for (const uint16& Entry : Entries)
+				{
+					FIntVector Loc = IndexTo3D(Entry,MaxX,MaxY);
+					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(1,0,0), MaxX,MaxY);
+
+					if (Entries.Contains(TestLocation))
+					{
+						continue;	
+					}
+					
+					if (ViewBlockers.Contains(TestLocation) && (MinimalMemoryOptimization || !Processed.Contains(TestLocation)))
+					{
+						TempEntriesX.Add(TestLocation);
+					}
+					else
+					{
+						bCanGrowX = false;
+						break;
+					}
+				}
+				
+				if (bCanGrowX)
+				{
+					X++;
+					Entries.Append(TempEntriesX);
+				}
+			}
+			
+			if (bCanGrowY)
+			{
+				TSet<uint16> TempEntriesY;
+
+				for (const uint16& Entry : Entries)
+				{
+					FIntVector Loc = IndexTo3D(Entry,MaxX,MaxY);
+					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(0,1,0), MaxX,MaxY);
+
+					if (Entries.Contains(TestLocation))
+					{
+						continue;	
+					}
+					
+					if (ViewBlockers.Contains(TestLocation) && (MinimalMemoryOptimization || !Processed.Contains(TestLocation)))
+					{
+						TempEntriesY.Add(TestLocation);
+					}
+					else
+					{
+						bCanGrowY = false;
+						break;
+					}
+				}
+
+				if (bCanGrowY)
+				{
+					Entries.Append(TempEntriesY);
+					Y++;
+				}
+			}
+			
+			if (bCanGrowZ)
+			{
+				TSet<uint16> TempEntriesZ;
+
+				for (const uint16& Entry : Entries)
+				{
+					FIntVector Loc = IndexTo3D(Entry,MaxX, MaxY);
+					const uint16 TestLocation = XYZToIndex(Loc + FIntVector(0,0,1), MaxX, MaxY);
+
+					if (Entries.Contains(TestLocation))
+					{
+						continue;	
+					}
+					
+					if (ViewBlockers.Contains(TestLocation) && (MinimalMemoryOptimization || !Processed.Contains(TestLocation)))
+					{
+						TempEntriesZ.Add(TestLocation);
+					}
+					else
+					{
+						bCanGrowZ = false;
+						break;
+					}
+				}
+
+				if (bCanGrowZ)
+				{
+					Entries.Append(TempEntriesZ);
+					Z++;
+				}
+			}
+		}
+		
+		Processed.Append(Entries);
+
+		{	// Build box.
+			FBox Base = Asset->GetCellBox();
+			Base = Base.MoveTo(LocationsToBuild[Origin]);
+			Base += Asset->GetCellBox().MoveTo(LocationsToBuild[Origin] + (FVector(X,Y,Z) * Asset->GetCellBox().GetSize()) );
+		
+			BoxScene.Add(Base);
+		}
+		// Skip cells we have processed already.
+		CurrentBox++;
+		while ( CurrentBox < ViewBlockers.Num() && Processed.Contains(ViewBlockers[CurrentBox]))
+		{
+			CurrentBox++;
+		}
+	}
+
+#if 0
+	if (BoxScene.Num() > 100)
+	{
+		for (auto Box : BoxScene)
+		{
+			DrawDebugBox(GetWorld(),Box.GetCenter(),Box.GetExtent(),FColor::Red,false,30.f);
+		}
+
+		SetActorTickEnabled(false);
+	}
+#endif
+}
 
 // Called every frame
 void APVGBuilder::Tick(float DeltaTime)
@@ -108,81 +444,7 @@ void APVGBuilder::Tick(float DeltaTime)
 	{
 		return;
 	}
-	
-	// Setup default params.
-	FCollisionQueryParams QueryParams;
-	QueryParams.bTraceComplex = true;
-	QueryParams.AddIgnoredActor(APVGManager::GetManager()->Player);
 
-	FCollisionResponseParams ResponseParams;
-	ResponseParams.CollisionResponse.SetAllChannels(ECollisionResponse::ECR_Block);
-
-	auto FindAnyPoint = [this,QueryParams,ResponseParams](FVector A, FVector B, FBox Base)
-	{
-		// A is target,
-		// B is self.
-		const FBox ABox = Base.ShiftBy(A);
-		const FBox BBox = Base.ShiftBy(B);
-
-		FVector AVertices[8];
-		FVector BVertices[8];
-		ABox.GetVertices(AVertices);
-		BBox.GetVertices(BVertices);
-
-		for (int32 i = 0; i < 8; i++)
-		{
-			const FVector& AVert = AVertices[i];
-					
-			for (int32 j = 0; j < 8; j++)
-			{
-				const FVector& BVert = BVertices[j];
-						
-				if(!GetWorld()->LineTraceTestByChannel(AVert,BVert,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams))
-				{
-					return true;
-				}
-			}
-		}
-		
-		// Centre to any point of B
-		const FVector OriginA = ABox.GetCenter();
-		for (int32 i = 0; i < 8; i++)
-		{
-			const FVector& BVert = BVertices[i];
-			if(!GetWorld()->LineTraceTestByChannel(BVert,OriginA,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams))
-			{
-				return true;
-			}
-		}
-		// Centre to any point of A
-		const FVector OriginB = BBox.GetCenter();
-		for (int32 i = 0; i < 8; i++)
-		{
-			const FVector& AVert = AVertices[i];
-			if(!GetWorld()->LineTraceTestByChannel(AVert,OriginB,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams))
-			{
-				return true;
-			}
-		}
-		FRandomStream Rand;
-		Rand.Initialize(FMath::Rand());
-		// try to trace against the box it self..
-		for (int32 i = 0; i < 500; i++)
-		{
-			FVector RandomPointInABox = UKismetMathLibrary::RandomPointInBoundingBoxFromStream(Rand,ABox.GetCenter(),ABox.GetExtent());
-			FVector RandomPointInBBox = UKismetMathLibrary::RandomPointInBoundingBoxFromStream(Rand,BBox.GetCenter(),ABox.GetExtent());
-			// Line trace.
-			if(!GetWorld()->LineTraceTestByChannel(RandomPointInABox,RandomPointInBBox,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams))
-			{
-				// When failed, we know we can see it.
-				return true;
-			}
-		}
-		
-		// Nothing found.
-		return false;
-	};
-	
 	if (CurrentCell >= LocationsToBuild.Num())
 	{
 		// We are done.
@@ -209,75 +471,278 @@ void APVGBuilder::Tick(float DeltaTime)
 		}
 
 		UE_LOG(LogTemp, Warning, TEXT("Package '%s' was successfully saved"), *PackageName)
+		UE_LOG(LogTemp,Warning,TEXT("Finished grid in %.f2 hour /(%.2f min)"),((FPlatformTime::Seconds() - BeginTime) / 60)/60, (FPlatformTime::Seconds() - BeginTime) / 60);
 		return;
 	}
-	
+
 	if (!MoveToLocation(CurrentCell))
 	{
 		// we are going to start tracing next frame.
 		bTraceCheckStage = true;
 		return;
 	}
+	
+	// Setup default params.
+	FCollisionQueryParams QueryParams;
+	QueryParams.bTraceComplex = true;
+	QueryParams.AddIgnoredActor(APVGManager::GetManager()->Player);
+
+	FCollisionResponseParams ResponseParams;
+	ResponseParams.CollisionResponse.SetAllChannels(ECollisionResponse::ECR_Block);
 
 	if (bTraceCheckStage)
 	{
-		double T = FPlatformTime::Seconds();
+		// DEBUG STATS:
+		double StartTime = FPlatformTime::Seconds();
+		double TimeSimpleTest = 0;
+		int32 NumOccludedBoxScene = 0;
+		double TimeOccludedBoxScene = 0;
+		int32 ShotgunTest = 0;
+		double TimeShotgunTest = 0;
+		bool bIsBoxSceneDirty = true;
+		
+		
 		TArray<FRawRegionVisibilityData16>& GridData = APVGManager::GetManager()->GridDataAsset->GridData;
 		UPVGPrecomputedGridDataAsset* GridDataAsset = APVGManager::GetManager()->GridDataAsset;
-
-		int32 BasicTrace = 0;
-		int32 AdvancedTrace = 0;
+		const int32 MaxX = GridDataAsset->GetGridSizeX();
+		const int32 MaxY = GridDataAsset->GetGridSizeY();
+		const int32 MaxZ = GridDataAsset->GetGridSizeZ();
 		
-		for (int32 i = 0; i < APVGManager::GetManager()->GridDataAsset->GridData.Num(); i++)
-		{
-			if (i == CurrentCell)
-			{	
-				continue;
-			}
-			
-			const bool bIsKnownVisible =	GridData[i].InvisibleRegions.Contains(CurrentCell);
-			const bool bIsKnownInvisible =	GridData[i].VisibleRegions.Contains(CurrentCell);
+		const FIntVector Origin = IndexTo3D(CurrentCell,MaxX,MaxY);
 
-			// Early out if this info has been assigned already.
-			if (bIsKnownVisible || bIsKnownInvisible)
+		TSet<uint16> HandledPoints;
+
+		int32 Iteration = 1;
+		while (true)
+		{
+			bool bShouldBreak = false;
+			
+			TSet<uint16> PointsToProcess;
+			
+			// Calculate corner points.
+			FIntVector MinLocation = Origin - FIntVector(Iteration,Iteration,Iteration);
+			FIntVector MaxLocation = Origin + FIntVector(Iteration,Iteration,Iteration);
+
+			if ( MinLocation.X <= 0 && MinLocation.Y <= 0 && MinLocation.Z <= 0 && MaxLocation.X >= MaxX && MaxLocation.Y >= MaxY && MaxLocation.Z >= MaxZ )
 			{
-				continue;
+				bShouldBreak = true;
 			}
 			
-			if (!GetWorld()->LineTraceTestByChannel(LocationsToBuild[i],LocationsToBuild[CurrentCell],ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams))
+			// Clamp
+			MinLocation.X = MinLocation.X < 0 ? 0 : MinLocation.X; 
+			MinLocation.Y = MinLocation.Y < 0 ? 0 : MinLocation.Y; 
+			MinLocation.Z = MinLocation.Z < 0 ? 0 : MinLocation.Z; 
+			MaxLocation.X = MaxLocation.X < MaxX ? MaxLocation.X : MaxX - 1;
+			MaxLocation.Y = MaxLocation.Y < MaxY ? MaxLocation.Y : MaxY - 1;
+			MaxLocation.Z = MaxLocation.Z < MaxZ ? MaxLocation.Z : MaxZ - 1;
+			
+			// Build Points.
+			
+			// Build XPlanes first.
+			for (int32 y = MinLocation.Y; y <= MaxLocation.Y ; y++)
 			{
-				//DrawDebugLine(GetWorld(),LocationsToBuild[i],LocationsToBuild[CurrentCell],FColor::Red,false,30.f);
-				GridDataAsset->SetDataCell(CurrentCell,i,true);
-				BasicTrace++;
+				for (int32 z = MinLocation.Z; z <= MaxLocation.Z ; z++)
+				{
+					PointsToProcess.Add(XYZToIndex(FIntVector(MinLocation.X,y,z),MaxX,MaxY));
+					PointsToProcess.Add(XYZToIndex(FIntVector(MaxLocation.X,y,z),MaxX,MaxY));
+				}
 			}
-			else if (FindAnyPoint(LocationsToBuild[i],LocationsToBuild[CurrentCell],APVGManager::GetManager()->CellSize))
+			
+			// YPlane.
+			for (int32 x = MinLocation.X; x <= MaxLocation.X ; x++)
 			{
-				GridDataAsset->SetDataCell(CurrentCell,i,true);
-				AdvancedTrace++;
+				for (int32 z = MinLocation.Z; z <= MaxLocation.Z ; z++)
+				{
+					PointsToProcess.Add(XYZToIndex(FIntVector(x,MinLocation.Y,z),MaxX,MaxY));
+					PointsToProcess.Add(XYZToIndex(FIntVector(x,MaxLocation.Y,z),MaxX,MaxY));
+				}
 			}
-			else // we can assume its invisible.
+
+			// Build top and bottom.
+			for (int32 x = MinLocation.X; x <= MaxLocation.X ; x++)
 			{
-				// we can assume invisible.
-				GridDataAsset->SetDataCell(CurrentCell,i,false);
+				for (int32 y = MinLocation.Y; y <= MaxLocation.Y ; y++)
+				{				
+					PointsToProcess.Add(XYZToIndex(FIntVector(x,y,MinLocation.Z),MaxX,MaxY));
+					PointsToProcess.Add(XYZToIndex(FIntVector(x,y,MaxLocation.Z),MaxX,MaxY));
+				}
+			}
+		
+			Iteration++;
+
+			constexpr int32 NumTasks = 24;
+			int32 NumPerTask = FMath::DivideAndRoundUp( PointsToProcess.Num(), NumTasks);
+			auto PointsToProcessArray = PointsToProcess.Array();
+			TArray<uint16> ViewBlockerArr[NumTasks];
+			TArray<uint16> CanSee[NumTasks];
+			TArray<uint16> Unresolved[NumTasks];
+
+			{
+				double Start = FPlatformTime::Seconds();
+				
+				ParallelFor(NumTasks,[&](int32 TaskID)
+				{
+					int32 Begin = TaskID * NumPerTask;
+					int32 End = FMath::Min(Begin + NumPerTask,PointsToProcess.Num());
+					for (int32 i = Begin; i < End; i++)
+					{
+						const auto Point = PointsToProcessArray[i];
+
+						if (Point == CurrentCell)
+						{
+							continue;
+						}
+					
+						const bool bIsKnownVisible =	GridData[Point].VisibleRegions.Contains(CurrentCell);
+						const bool bIsKnownInvisible =	GridData[Point].InvisibleRegions.Contains(CurrentCell);
+						if (bIsKnownVisible)
+						{
+							continue;
+						}
+						if (bIsKnownInvisible)
+						{
+							ViewBlockerArr[TaskID].Add(Point);
+							continue;
+						}
+						const bool CanNotReachPoint = !GetWorld()->LineTraceTestByChannel(LocationsToBuild[Point],LocationsToBuild[CurrentCell],ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams);
+						if (CanNotReachPoint)
+						{
+							CanSee[TaskID].Add(Point);
+							continue;
+						}
+					
+						if (BoxCornerTraceCheck(LocationsToBuild[Point],LocationsToBuild[CurrentCell],APVGManager::GetManager()->CellSize))
+						{
+							CanSee[TaskID].Add(Point);
+							continue;
+						}
+
+						// Unresolved.
+						Unresolved[TaskID].Add(Point);
+					}
+				});
+				
+				TimeSimpleTest += FPlatformTime::Seconds() - Start;
+			}
+
+			// Resolve parallel work
+			for (int32 i = 0; i < NumTasks; i++)
+			{
+				for (int32 j = 0; j < CanSee[i].Num(); j++)
+				{
+					GridDataAsset->SetDataCell(CurrentCell,CanSee[i][j],true);
+				}
+
+				ViewBlockers.Append(ViewBlockerArr[i]);
+			}
+			
+			// Process unprocessed points.
+			for	(int32 i = 0; i < NumTasks; i++)
+			{
+				for (int32 j = 0; j < Unresolved[i].Num(); j++)
+				{
+					const auto Point = Unresolved[i][j];
+#if BOX_SCENE
+					{	// Box test
+						double Start = FPlatformTime::Seconds();
+
+						if (bIsBoxSceneDirty)
+						{
+							UpdateBoxScene();
+							bIsBoxSceneDirty = false;
+						}
+					
+						if (BoxOcclusion(CurrentCell,Point,APVGManager::GetManager()->CellSize))
+						{
+							NumOccludedBoxScene++;
+							GridDataAsset->SetDataCell(CurrentCell,Point,false);
+							
+							TimeOccludedBoxScene += FPlatformTime::Seconds() - Start;
+							continue;
+						}
+						TimeOccludedBoxScene += FPlatformTime::Seconds() - Start;
+					}
+#endif
+					// Shogun
+					{
+						ShotgunTest++;
+						double Start = FPlatformTime::Seconds();
+						FBox Current = APVGManager::GetManager()->GridDataAsset->GetCellBox().MoveTo(LocationsToBuild[CurrentCell]);
+						FBox Target = APVGManager::GetManager()->GridDataAsset->GetCellBox().MoveTo(LocationsToBuild[Point]);
+
+						const int32 NumRays = 5000;
+						const int32 NumRaysPerTask = FMath::DivideAndRoundUp(NumRays,NumTasks);
+						std::atomic<bool> bDidHit = false;
+
+						ParallelFor(NumTasks,[&](int32 Task )
+						{
+							for (int32 iray = 0; iray < NumRaysPerTask; iray++)
+							{
+								const FVector A = FMath::RandPointInBox(Current);
+								const FVector B = FMath::RandPointInBox(Target);
+
+								// We are checking here if one of the rays does hit the target, since it shouldn't hit!
+								const bool WasBlocked = GetWorld()->LineTraceTestByChannel(A,B,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams);
+								if (!WasBlocked)
+								{
+									break;
+								}
+
+								// Failed case.
+								if (bDidHit)
+								{
+									break;
+								}
+							}
+						});
+
+						if (bDidHit)
+						{
+							GridDataAsset->SetDataCell(CurrentCell,Point,true);
+						}
+						else
+						{
+							GridDataAsset->SetDataCell(CurrentCell,Point,false);
+							ViewBlockers.Add(Point);
+							bIsBoxSceneDirty = true;
+						}
+						TimeShotgunTest += FPlatformTime::Seconds() - Start;
+					}
+				}
+			}
+			
+			if (bShouldBreak)
+			{
+				break;
 			}
 		}
+
+		UE_LOG(LogTemp,Warning,TEXT("Finished %d,Simple Tests %.3f.\tBox Scene Occluded: %d (%.3f sec) SceneSize %d\t Shotgun Trace: %d %.3f."),
+			CurrentCell,TimeSimpleTest,
+			NumOccludedBoxScene,TimeOccludedBoxScene,
+			ViewBlockers.Num(),
+			ShotgunTest,TimeShotgunTest);
 		
-		// Nothing to test, we can move to the next cell to test.
+		UE_LOG(LogTemp,Warning,TEXT("%d visible %d occluded. Computed %.3f"),
+			GridData[CurrentCell].VisibleRegions.Num(),
+			GridData[CurrentCell].InvisibleRegions.Num(),
+			FPlatformTime::Seconds() - StartTime);
+		
+		// check missing one.
 		bTraceCheckStage = true;
 		CurrentCell++;
 
-		const float Pct = (float(CurrentCell) / float(LocationsToBuild.Num())) * 100;
-		UE_LOG(LogTemp,Warning,TEXT("cell %d/%d (%.2f%%)"), CurrentCell , LocationsToBuild.Num(), Pct );
-		UE_LOG(LogTemp,Warning,TEXT("Finished trace test. Trace tested %d, %.2fMS"), LocationsToBuild.Num(), (FPlatformTime::Seconds() - T) * 1000);
-	}
+		ViewBlockers.Reset();
+		BoxScene.Reset();
+ 	}
 }
 
 bool APVGBuilder::MoveToLocation(int32 Index)
 {
-	if(!LocationsToBuild[Index].Equals(APVGManager::GetManager()->Player->GetActorLocation()))
+	if(!LocationsToBuild[Index].Equals(GetWorld()->GetFirstPlayerController()->GetPawn()->GetActorLocation()))
 	{
 		// Update location.
-		APVGManager::GetManager()->Player->SetActorLocation(LocationsToBuild[Index]);
+		GetWorld()->GetFirstPlayerController()->GetPawn()->SetActorLocation(LocationsToBuild[Index]);
 		GetWorld()->FlushLevelStreaming();
 		
 		return false;
