@@ -53,16 +53,22 @@ public:
 	UFUNCTION(BlueprintCallable)
 	static void ReportActorToPVGManager(AActor* Actor);
 
+	bool IsCellHidden(int32 Index) const;
+	
 protected:
 	// Called when the game starts or when spawned
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void SetHidden(AActor* Actor, bool bState);
 	
+	virtual void DrawDebugHUDInfo();
+	void DebugDrawSelected(TArray<FString>& OutPrints);
 private:
 	void UpdateCellsVisibility(int32 PlayerCellLocation);
 	
 	FVector GetLocationInGridSpace(const FVector& Location) const;
 	int32 GetPlayerGridIndex() const;
+	int32 GetIndexFromLocation(const FVector& Location) const;
 	
 	FVector IndexToLocation(int32 Index) const;
 	

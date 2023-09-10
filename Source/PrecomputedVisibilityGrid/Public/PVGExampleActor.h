@@ -27,4 +27,6 @@ public:
 	/* Begin PVGInterface*/
 	virtual void UpdateVisibility_Implementation(bool NewVisibility) override;
 	/* End PVGInterface */
+
+	void RegisterToManager();
 };

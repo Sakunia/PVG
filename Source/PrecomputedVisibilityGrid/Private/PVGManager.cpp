@@ -3,9 +3,12 @@
 
 #include "PVGManager.h"
 
+#include "Editor.h"
+#include "PrecomputedVisibilityGrid.h"
 #include "PVGBuilder.h"
 #include "PVGInterface.h"
 #include "PVGPrecomputedGridDataAsset.h"
+#include "Selection.h"
 #include "Components/BoxComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
@@ -80,13 +83,17 @@ APVGManager::APVGManager()
 void APVGManager::ReportActorToPVGManager(AActor* Actor)
 {
 	APVGManager* PVGManager = GetManager();
-
+	if (!PVGManager)
+	{
+		UE_LOG(LogTemp,Error,TEXT("NO PVG FOUND"));
+		return;
+	}
+	
 	FVector Origin;
 	FVector Extent;
 
 	Actor->GetActorBounds(false,Origin,Extent,false);
 
-	const FVector OriginInGridSpace = PVGManager->GetLocationInGridSpace(Origin);
 	const FVector MinInGridSpace = PVGManager->GetLocationInGridSpace(Origin - Extent);
 	const FVector MaxInGridSpace = PVGManager->GetLocationInGridSpace(Origin + Extent);
 
@@ -107,6 +114,11 @@ void APVGManager::ReportActorToPVGManager(AActor* Actor)
 		if (PVGManager->CellRuntimeData.IsValidIndex(MinId))
 		{
 			PVGManager->CellRuntimeData[MinId].Actors.Add(Actor);
+
+			if(Manager->IsCellHidden(MinId))
+			{
+				Manager->SetHidden(Actor,true);
+			}
 		}
 	}
 	else // Multi cell actor. figure out which cells.
@@ -126,17 +138,31 @@ void APVGManager::ReportActorToPVGManager(AActor* Actor)
 			}
 		}
 
-		Entry->Actor = Actor;
-		Entry->VisibleCounter = Ids.Num();
+		// Determine initial state.
+		bool bIsHidden = true;
+		for (int32 i = 0; i< Ids.Num(); i++)
+		{
+			PVGManager->CellRuntimeData[Ids[i]].MultiCellActors.Add(Entry);
+			
+			if(!Manager->IsCellHidden(Ids[i]))
+			{
+				bIsHidden = false;
+			}
+		}
 
-		//FString Numbers;
-		//for (int32 i = 0; i< Ids.Num(); i++)
-		//{
-		//	Manager->CellRuntimeData[Ids[i]].MultiCellActors.Add(Entry);
-		//	Numbers.AppendInt(Ids[i]);
-		//	Numbers += ",";
-		//}
+		Entry->Actor = Actor;
+		Entry->VisibleCounter = !bIsHidden ? Ids.Num() : 0;
+
+		if (bIsHidden)
+		{
+			Manager->SetHidden(Actor,true);
+		}
 	}
+}
+
+bool APVGManager::IsCellHidden(int32 Index) const
+{
+	return HiddenCells.Contains(Index);
 }
 
 // Called when the game starts or when spawned
@@ -170,12 +196,137 @@ void APVGManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Manager = nullptr;
 }
 
+void APVGManager::SetHidden(AActor* Actor, bool bState)
+{
+	//if (Actors[i]->GetClass()->ImplementsInterface(UPVGInterface::StaticClass()))
+	//{
+	//	IPVGInterface::Execute_UpdateVisibility(Actors[i],bHide);
+	//}
+	//else
+	{
+		Actor->SetActorHiddenInGame(bState);
+		//DrawDebugBox(GetWorld(),Actor->GetActorLocation(),FVector(200.f),FColor::Red,true,10.f );
+	} 
+}
+
+void APVGManager::DrawDebugHUDInfo()
+{
+	if (GEngine)
+	{
+		TArray<FString> ToPrint;
+		const int32 CurrentCell = GetPlayerGridIndex();
+		// Header
+		ToPrint.Add(FString("Precomputed Debug View"));
+
+		// Current cell.
+		ToPrint.Add(FString("Current Cell: ") + FString::FromInt(CurrentCell));
+
+		// Cell Data.
+		if (CellRuntimeData.IsValidIndex(CurrentCell))
+		{
+			const int32 NumActorsInCell = CellRuntimeData[CurrentCell].Actors.Num();
+			const int32 NumMultiActorsInCell = CellRuntimeData[CurrentCell].MultiCellActors.Num();
+
+			ToPrint.Add(FString("Num Simple Actors in cell: ") + FString::FromInt(NumActorsInCell));
+			ToPrint.Add(FString("Num Multi cell Actors in cell: ") + FString::FromInt(NumMultiActorsInCell));
+		}
+
+		// Check if we have something selected
+#if WITH_EDITOR
+		if (GEditor )
+		{
+			bool bGotAnActor = false;
+			TArray<AActor*> SelectedActors;
+			GEditor->GetSelectedActors()->GetSelectedObjects<AActor>(SelectedActors);
+			
+			for ( auto Actor : SelectedActors)
+			{
+				if (IsValid(Actor) && Actor->GetClass()->ImplementsInterface(UPVGInterface::StaticClass()))
+				{
+					bGotAnActor = true;
+					break;
+				}
+			}
+
+			if (bGotAnActor)
+			{
+				ToPrint.Add("\tSelectedActor(s):");
+				
+				for (const AActor* Actor : SelectedActors)
+				{
+					if (IsValid(Actor) && Actor->GetClass()->ImplementsInterface(UPVGInterface::StaticClass()))
+					{
+						ToPrint.Add("\t\t" + Actor->GetName());
+						int32 GridIndex = GetIndexFromLocation(Actor->GetActorLocation());
+						
+						if (CellRuntimeData.IsValidIndex(GridIndex))
+						{
+							for (const FCellActorContainer* Entry : CellRuntimeData[GridIndex].MultiCellActors)
+							{
+								if (Entry->Actor == Actor)
+								{
+									ToPrint.Add("\t\tVisCounter: " + FString::FromInt(Entry->VisibleCounter));
+
+									// Find cells.
+									const FIntVector Index3D = IndexTo3D(GridIndex, GridDataAsset->GetGridSizeX(), GridDataAsset->GetGridSizeY());
+
+									for (int32 x = -1; x <= 1; x++)
+									{
+										for (int32 y = -1; y <= 1; y++)
+										{
+											for (int32 z = -1; z <= 1; z++)
+											{
+												if (Index3D.X + x < GridDataAsset->GetGridSizeX() && Index3D.X + x >= 0 &&
+													Index3D.Y + y < GridDataAsset->GetGridSizeY() && Index3D.Y + y >= 0 &&
+													Index3D.Z + z < GridDataAsset->GetGridSizeZ() && Index3D.Z + z >= 0 )
+												{
+													const int32 OffsetId = XYZToIndex(Index3D.X + x,Index3D.Y + y,Index3D.Z + z);
+													if (CellRuntimeData.IsValidIndex(OffsetId))
+													{
+														auto TestEntry = CellRuntimeData[OffsetId].MultiCellActors.FindByPredicate([TestActor = Entry->Actor](const FCellActorContainer* A)
+														{
+															return A->Actor == TestActor;
+														});
+																												
+														if (TestEntry != nullptr)
+														{
+															DrawDebugSphere(GWorld,IndexToLocation(OffsetId),16,6,FColor::Purple,false,-1,255);
+
+															if (!HiddenCells.Contains(OffsetId))
+															{
+																DrawDebugBox(GWorld,IndexToLocation(OffsetId),CellSize.GetExtent(),FColor::Orange,false,-1,255);
+															}
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+#endif
+		for (int32 i = ToPrint.Num() - 1; i >= 0; --i)
+		{
+			GEngine->AddOnScreenDebugMessage(i,-1,FColor::Blue, ToPrint[i],false);
+		}
+	}
+}
+
+void APVGManager::DebugDrawSelected(TArray<FString>& OutPrints)
+{
+}
+
 // Called every frame
 void APVGManager::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-		bool bIsEnabled = false;
+	bool bIsEnabled = false;
 	
 	if (!GridDataAsset)
 	{
@@ -245,12 +396,17 @@ void APVGManager::Tick(float DeltaTime)
 					}
 					
 					DrawDebugBox(GetWorld(),CellLocation,CellSize.GetExtent(),DebugColor,false,-1,255);
+					DrawDebugPoint(GetWorld(),CellLocation,5.f,DebugColor,false,-1,255);
+
 				}
 
 				DrawDebugBox(GetWorld(),CurrentCellLocation,CellSize.GetExtent(),FColor::Green,false,-1,255);
 			}
 		}
 	}
+
+	// Debug
+	DrawDebugHUDInfo();
 }
 
 void APVGManager::UpdateCellsVisibility(int32 PlayerCellLocation)
@@ -365,6 +521,7 @@ void APVGManager::UpdateCellVisibility(int32 Cell, bool bHide)
 	{
 		if (MultiCellActors.IsValidIndex(i) && MultiCellActors[i])	
 		{
+			UE_LOG(LogTemp,Warning,TEXT("Mutli actor cell %d"),Cell);
 			if (bHide == true)
 			{
 				MultiCellActors[i]->VisibleCounter--;
@@ -372,19 +529,19 @@ void APVGManager::UpdateCellVisibility(int32 Cell, bool bHide)
 			else
 			{
 				MultiCellActors[i]->VisibleCounter++;
-
 			}
+			UE_LOG(LogTemp,Warning,TEXT("Vis counter: %d"),MultiCellActors[i]->VisibleCounter);
 
 			// Can we hide it?
 			if ( MultiCellActors[i]->VisibleCounter == 0 )
 			{
-				MultiCellActors[i]->Actor->SetActorHiddenInGame(true);
+				SetHidden(MultiCellActors[i]->Actor, true);
 			}
 			else
 			{
 				if (MultiCellActors[i]->Actor->IsHidden())
 				{
-					MultiCellActors[i]->Actor->SetActorHiddenInGame(false);
+					SetHidden(MultiCellActors[i]->Actor, false);
 				}
 			}
 		}
@@ -392,14 +549,7 @@ void APVGManager::UpdateCellVisibility(int32 Cell, bool bHide)
 
 	for (int32 i = 0; i < Actors.Num(); i++)
 	{
-		if (Actors[i]->GetClass()->ImplementsInterface(UPVGInterface::StaticClass()))
-		{
-			IPVGInterface::Execute_UpdateVisibility(Actors[i],bHide);
-		}
-		else
-		{
-			Actors[i]->SetActorHiddenInGame(bHide);
-		} 
+		SetHidden(Actors[i], bHide);
 	}
 }
 	
@@ -413,6 +563,17 @@ FVector APVGManager::GetLocationInGridSpace(const FVector& Location) const
 int32 APVGManager::GetPlayerGridIndex() const
 {
 	const FVector PlayerLocationInGridSpace = GetLocationInGridSpace(Player->GetActorLocation());
+
+	const int32 X = FMath::FloorToInt(float(PlayerLocationInGridSpace.X / CellSize.GetSize().X));
+	const int32 Y = FMath::FloorToInt(float(PlayerLocationInGridSpace.Y / CellSize.GetSize().Y));
+	const int32 Z = FMath::FloorToInt(float(PlayerLocationInGridSpace.Z / CellSize.GetSize().Z));
+
+	return XYZToIndex(X,Y,Z);
+}
+
+int32 APVGManager::GetIndexFromLocation(const FVector& Location) const
+{
+	const FVector PlayerLocationInGridSpace = GetLocationInGridSpace(Location);
 
 	const int32 X = FMath::FloorToInt(float(PlayerLocationInGridSpace.X / CellSize.GetSize().X));
 	const int32 Y = FMath::FloorToInt(float(PlayerLocationInGridSpace.Y / CellSize.GetSize().Y));

@@ -96,7 +96,7 @@ public:
 
 	int32 IsCellIndexValid(int32 Index) const
 	{
-		return GridData.IsValidIndex(Index);// || CompressedGridData.IsValidIndex(Index);
+		return GridCellData.IsValidIndex(Index);// || CompressedGridData.IsValidIndex(Index);
 	}
 
 	FBox GetGridBounds() const { return GridBounds;}

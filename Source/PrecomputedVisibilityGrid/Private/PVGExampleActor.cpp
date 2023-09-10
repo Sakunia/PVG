@@ -18,28 +18,28 @@ void APVGExampleActor::BeginPlay()
 {
 	Super::BeginPlay();
 
-	APVGManager::GetManager()->ReportActorToPVGManager(this);
+	RegisterToManager();
+
 }
 
 // Called every frame
 void APVGExampleActor::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
-
 }
 
 void APVGExampleActor::UpdateVisibility_Implementation(bool NewVisibility)
 {
-	for (auto Prim : TInlineComponentArray<UPrimitiveComponent*>(this))
+	for (UPrimitiveComponent* Prim : TInlineComponentArray<UPrimitiveComponent*>(this))
 	{
-		if (NewVisibility && !Prim->IsRenderStateCreated() )
+		if (NewVisibility && Prim->IsRegistered() )
 		{
-			Prim->CreateRenderState_Concurrent(nullptr);
+			Prim->UnregisterComponent();
 			continue;
 		}
-		if (Prim->IsRenderStateCreated())
+		if (!Prim->IsRegistered())
 		{
-			Prim->DestroyRenderState_Concurrent();
+			Prim->RegisterComponent();
 			continue;
 		}
 		
@@ -47,3 +47,21 @@ void APVGExampleActor::UpdateVisibility_Implementation(bool NewVisibility)
 	}
 }
 
+void APVGExampleActor::RegisterToManager()
+{
+	if (APVGManager::GetManager())
+	{
+		APVGManager::GetManager()->ReportActorToPVGManager(this);
+	}
+	else
+	{
+		GetWorld()->GetTimerManager().SetTimerForNextTick([=]()
+		{
+			if (IsValid(this))
+			{
+				// try again.
+				RegisterToManager();
+			}
+		});
+	}	
+}
