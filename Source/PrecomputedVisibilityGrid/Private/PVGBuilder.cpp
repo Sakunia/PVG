@@ -700,6 +700,7 @@ void APVGBuilder::Tick(float DeltaTime)
 								const bool WasBlocked = World->LineTraceTestByChannel(A,B,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams);
 								if (!WasBlocked)
 								{
+									bDidHit = true;
 									break;
 								}
 
