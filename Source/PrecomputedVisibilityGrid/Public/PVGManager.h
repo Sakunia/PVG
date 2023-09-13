@@ -109,7 +109,7 @@ public:
 #if WITH_EDITORONLY_DATA
 #if WITH_EDITOR
 	UFUNCTION(CallInEditor)
-	void StartBuild();
+	APVGBuilder* StartBuild();
 
 	UFUNCTION(CallInEditor)
 	void DebugDrawCells();

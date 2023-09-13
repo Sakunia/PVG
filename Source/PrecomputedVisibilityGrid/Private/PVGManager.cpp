@@ -607,8 +607,10 @@ int32 APVGManager::XYZToIndex(int32 x, int32 y, int32 z) const
 }
 
 #if WITH_EDITOR
-void APVGManager::StartBuild()
+APVGBuilder* APVGManager::StartBuild()
 {
+	Manager = this;
+	
 	SetActorTickEnabled(false);
 	
 	const FBox Bounds = RootComponent->GetStreamingBounds();
@@ -630,9 +632,6 @@ void APVGManager::StartBuild()
 				FVector Location = FVector(CellSizeX * x,CellSizeY * y,CellSizeZ * z) + FVector(CellSizeX/2,CellSizeY/2,CellSizeZ/2);
 				Location += GetActorLocation() - Bounds.GetExtent();
 				Locations.Add(Location);
-
-				// Debug draw
-				// DrawDebugBox(GetWorld(),Location,CellSize.GetExtent(),FColor::Blue,false,10.f,255,10);
 			}
 		}
 	}
@@ -641,6 +640,8 @@ void APVGManager::StartBuild()
 
 	APVGBuilder* Builder = GetWorld()->SpawnActor<APVGBuilder>();
 	Builder->Initialize(Locations,FIntVector(SizeX,SizeY,SizeZ));
+
+	return Builder;
 }
 
 void APVGManager::DebugDrawCells()

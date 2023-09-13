@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Components/WorldPartitionStreamingSourceComponent.h"
 #include "GameFramework/Actor.h"
 #include "PVGBuilder.generated.h"
 
@@ -13,7 +14,7 @@ UCLASS()
 class PRECOMPUTEDVISIBILITYGRID_API APVGBuilder : public AActor
 {
 	GENERATED_BODY()
-	
+
 public:	
 	// Sets default values for this actor's properties
 	APVGBuilder();
@@ -61,4 +62,7 @@ private:
 	TArray<FBox> BoxScene;
 
 	double BeginTime;
+
+	UPROPERTY()
+	UWorldPartitionStreamingSourceComponent* StreamingSourceComponent;
 };

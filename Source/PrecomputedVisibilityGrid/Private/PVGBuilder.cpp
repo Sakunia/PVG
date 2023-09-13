@@ -3,10 +3,14 @@
 
 #include "PVGBuilder.h"
 
+#include "EngineUtils.h"
 #include "PrecomputedVisibilityGrid.h"
 #include "PVGManager.h"
 #include "PVGPrecomputedGridDataAsset.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "InstancedFoliageActor.h"
+#include "Async/ParallelFor.h"
+#include "Components/WorldPartitionStreamingSourceComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "UObject/SavePackage.h"
@@ -31,6 +35,9 @@ APVGBuilder::APVGBuilder()
  	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = true;
+
+	RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+	StreamingSourceComponent = CreateDefaultSubobject<UWorldPartitionStreamingSourceComponent>(TEXT("StreamingSourceComp"));
 }
 
 void APVGBuilder::Initialize(const TArray<FVector>& InLocations, FIntVector GridSize)
@@ -67,7 +74,7 @@ UPVGPrecomputedGridDataAsset* APVGBuilder::GetOrCreateCellData(FIntVector GridSi
 	
 	if (!Manager->GridDataAsset)
 	{
-		const FString LevelName = GetWorld()->PersistentLevel.GetName();
+		const FString LevelName = GWorld->PersistentLevel.GetName();
 		FString GridName = FString::FromInt(GridSize.X) + "_";
 		GridName += FString::FromInt(GridSize.Y) + "_";
 		GridName += FString::FromInt(GridSize.Z);
@@ -241,6 +248,8 @@ bool APVGBuilder::BoxOcclusion(uint16 Location, uint16 Target, FBox BaseBox)
 
 bool APVGBuilder::BoxCornerTraceCheck(FVector A, FVector B, FBox Base)
 {
+	FWorldContext& EditorWorldContext = GEditor->GetEditorWorldContext();
+	
 	FCollisionResponseParams ResponseParams;
 	ResponseParams.CollisionResponse.SetAllChannels(ECollisionResponse::ECR_Block);
 	
@@ -264,7 +273,7 @@ bool APVGBuilder::BoxCornerTraceCheck(FVector A, FVector B, FBox Base)
 		{
 			const FVector& BVert = BVertices[j];
 						
-			if(!GetWorld()->LineTraceTestByChannel(AVert,BVert,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams))
+			if(!EditorWorldContext.World()->LineTraceTestByChannel(AVert,BVert,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams))
 			{
 				return true;
 			}
@@ -421,18 +430,6 @@ void APVGBuilder::UpdateBoxScene()
 			CurrentBox++;
 		}
 	}
-
-#if 0
-	if (BoxScene.Num() > 100)
-	{
-		for (auto Box : BoxScene)
-		{
-			DrawDebugBox(GetWorld(),Box.GetCenter(),Box.GetExtent(),FColor::Red,false,30.f);
-		}
-
-		SetActorTickEnabled(false);
-	}
-#endif
 }
 
 // Called every frame
@@ -440,7 +437,7 @@ void APVGBuilder::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	if (!bIsInitialized)
+ 	if (!bIsInitialized)
 	{
 		return;
 	}
@@ -481,15 +478,33 @@ void APVGBuilder::Tick(float DeltaTime)
 		bTraceCheckStage = true;
 		return;
 	}
+
+	// Recaptured every frame to ensure we never get them in the test scene.
+	TArray<AActor*> FoliageActors;
+	for (TActorIterator<AActor> It(GetWorld(), AInstancedFoliageActor::StaticClass()); It; ++It)
+	{
+		if (auto FIA = *It)
+		{
+			FoliageActors.Add(FIA);
+		}
+	}
+
 	
 	// Setup default params.
 	FCollisionQueryParams QueryParams;
 	QueryParams.bTraceComplex = true;
-	QueryParams.AddIgnoredActor(APVGManager::GetManager()->Player);
-
+	QueryParams.AddIgnoredActors(FoliageActors);
+	
 	FCollisionResponseParams ResponseParams;
 	ResponseParams.CollisionResponse.SetAllChannels(ECollisionResponse::ECR_Block);
+	
+	// Ignore all removables in the world.
+	ResponseParams.CollisionResponse.SetResponse(ECC_Destructible,ECR_Ignore);
+	ResponseParams.CollisionResponse.SetResponse(ECC_WorldDynamic,ECR_Ignore);
 
+	FWorldContext& EditorWorldContext = GEditor->GetEditorWorldContext();
+	UWorld* World = EditorWorldContext.World();
+	
 	if (bTraceCheckStage)
 	{
 		// DEBUG STATS:
@@ -604,7 +619,7 @@ void APVGBuilder::Tick(float DeltaTime)
 							ViewBlockerArr[TaskID].Add(Point);
 							continue;
 						}
-						const bool CanNotReachPoint = !GetWorld()->LineTraceTestByChannel(LocationsToBuild[Point],LocationsToBuild[CurrentCell],ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams);
+						const bool CanNotReachPoint = !World->LineTraceTestByChannel(LocationsToBuild[Point],LocationsToBuild[CurrentCell],ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams);
 						if (CanNotReachPoint)
 						{
 							CanSee[TaskID].Add(Point);
@@ -682,7 +697,7 @@ void APVGBuilder::Tick(float DeltaTime)
 								const FVector B = FMath::RandPointInBox(Target);
 
 								// We are checking here if one of the rays does hit the target, since it shouldn't hit!
-								const bool WasBlocked = GetWorld()->LineTraceTestByChannel(A,B,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams);
+								const bool WasBlocked = World->LineTraceTestByChannel(A,B,ECollisionChannel::ECC_Visibility,QueryParams,ResponseParams);
 								if (!WasBlocked)
 								{
 									break;
@@ -739,10 +754,10 @@ void APVGBuilder::Tick(float DeltaTime)
 
 bool APVGBuilder::MoveToLocation(int32 Index)
 {
-	if(!LocationsToBuild[Index].Equals(GetWorld()->GetFirstPlayerController()->GetPawn()->GetActorLocation()))
+	if(!LocationsToBuild[Index].Equals(GetActorLocation()))
 	{
 		// Update location.
-		GetWorld()->GetFirstPlayerController()->GetPawn()->SetActorLocation(LocationsToBuild[Index]);
+		SetActorLocation(LocationsToBuild[Index]);
 		GetWorld()->FlushLevelStreaming();
 		
 		return false;

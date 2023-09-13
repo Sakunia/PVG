@@ -40,7 +40,8 @@ public class PrecomputedVisibilityGrid : ModuleRules
 				"SlateCore",
 				"RHI",
 				"RenderCore",
-				"DeveloperSettings"
+				"DeveloperSettings",
+				"Foliage",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
@@ -48,6 +49,8 @@ public class PrecomputedVisibilityGrid : ModuleRules
 		if (Target.bBuildEditor)
 		{
 			PrivateDependencyModuleNames.Add("UnrealEd");
+			PrivateDependencyModuleNames.Add("EditorScriptingUtilities");
+
 		}
 		
 		DynamicallyLoadedModuleNames.AddRange(
