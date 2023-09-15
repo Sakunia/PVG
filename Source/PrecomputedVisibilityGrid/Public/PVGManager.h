@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "PVGCulling.h"
 #include "GameFramework/Actor.h"
 #include "PVGManager.generated.h"
 
@@ -44,7 +45,7 @@ class PRECOMPUTEDVISIBILITYGRID_API APVGManager : public AActor
 public:	
 	// Sets default values for this actor's properties
 	APVGManager();
-	
+
 	// Called every frame
 	virtual void Tick(float DeltaTime) override;
 
@@ -54,7 +55,9 @@ public:
 	static void ReportActorToPVGManager(AActor* Actor);
 
 	bool IsCellHidden(int32 Index) const;
-	
+
+	virtual bool IsInsideOccludedArea(const FBoxSphereBounds& Box) const;
+
 protected:
 	// Called when the game starts or when spawned
 	virtual void BeginPlay() override;
@@ -62,6 +65,8 @@ protected:
 	virtual void SetHidden(AActor* Actor, bool bState);
 	
 	virtual void DrawDebugHUDInfo();
+	virtual void DrawDebugOcclusionScene();
+
 	void DebugDrawSelected(TArray<FString>& OutPrints);
 private:
 	void UpdateCellsVisibility(int32 PlayerCellLocation);
@@ -78,11 +83,14 @@ private:
 
 	void UpdateCells();
 
+	void UpdateOcclusionScene();
+	
 	void UpdateCellVisibility(int32 Cell,bool bHide);
 	
 protected:
 	UPROPERTY(EditInstanceOnly)
 	UPVGPrecomputedGridDataAsset* GridDataAsset;
+	TSharedPtr<IPVGCulling> CullingPass;
 
 private:
 	UPROPERTY()
@@ -102,6 +110,10 @@ private:
 	TArray<int32> CellsToUnHide;
 	TArray<int32> HiddenCells;
 
+	TArray<FBox> OcclusionScene;
+	
+	//TSet<int32> HiddenPrimitives;
+	bool bIsEnabled = true;
 
 public:
 	friend class APVGBuilder;
@@ -119,24 +131,7 @@ public:
 
 	/*Saved on asset data.*/
 	FBox GridBounds;
-	
-	UFUNCTION(CallInEditor)
-	void Test();
-
-	UPROPERTY(EditAnywhere,Category="Debug",meta = (AllowPrivateAccess = true))
-	FVector LocationA;
-
-	UPROPERTY(EditAnywhere,Category="Debug",meta = (AllowPrivateAccess = true))
-	FVector LocationB;
-	
-	UPROPERTY(EditAnywhere,Category="Debug",meta = (AllowPrivateAccess = true))
-	FVector Vieuw;
 
 #endif
 #endif
-	UFUNCTION(BlueprintCallable)
-	static TArray<FVector> boxverts(FBox box);
-	
-	UFUNCTION(BlueprintCallable)
-	static TArray<FVector2D> Testlala(FBox A, FBox B, FVector ViewLocation, FRotator ViewRotation, UObject* worldcontext );
 };
